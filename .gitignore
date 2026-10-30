@@ -1,0 +1,12 @@
+# Secrets - NEVER commit
+*.pem
+*.ppk
+.env
+.aws/
+
+# Python / OS
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+*.zip
