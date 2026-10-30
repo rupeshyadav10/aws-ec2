@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Highly available web hosting on EC2 - two Apache servers bootstrapped with User Data
+  behind an Application Load Balancer with health checks, an admin server with an
+  Elastic IP, an S3 bucket for log backups, IAM role and CloudWatch alarm.
+  Author: Rupesh Kumar Yadav
+
+# NOTE: infrastructure/template.yaml is GENERATED from this file by build_template.py
+# (it injects scripts/bootstrap-userdata.sh). Edit this base file, then re-run the builder.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ec2-ha-web
+    AllowedPattern: "^[a-z0-9-]{3,24}$"
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair used for SSH (Day 3).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different Availability Zones.
+  AdminCidr:
+    Type: String
+    Description: Your public IP in CIDR form (e.g. 203.0.113.10/32). Only this range may SSH in.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------------- S3: log backups (Day 1) ----------------
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-logs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 30
+
+  # ---------------- Security groups (Day 3) ----------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer - HTTP from the internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP from anywhere }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-alb-sg" }]
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web servers - HTTP only from the load balancer, SSH only from admin IP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: HTTP from ALB only }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr, Description: SSH from admin IP }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web-sg" }]
+
+  AdminSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Admin server - SSH from admin IP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr, Description: SSH from admin IP }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-admin-sg" }]
+
+  # ---------------- IAM role for the web servers ----------------
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: "sts:AssumeRole" }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # optional browser-based shell (Session Manager)
+      Policies:
+        - PolicyName: UploadLogsToBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${BackupBucket.Arn}/logs/*"
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebInstanceRole]
+
+  # ---------------- Launch template with bootstrap script (Day 4) ----------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-web-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds: [!Ref WebSecurityGroup]
+        IamInstanceProfile: { Arn: !GetAtt WebInstanceProfile.Arn }
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }   # IMDSv2 only
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # EC2 bootstrap script (User Data) - Apache web server + hourly log backup to S3
+            # Author: Rupesh Kumar Yadav
+            #
+            # Runs once as root on first boot of an Amazon Linux 2023 instance.
+            #   * CloudFormation: infrastructure/build_template.py injects this file into the
+            #     template and replaces ${BackupBucket} with the real S3 bucket automatically.
+            #   * Console labs (Day 4): paste this into "Advanced details > User data" and
+            #     replace ${BackupBucket} with your bucket name (or leave it - the backup step is skipped).
+            #
+            # NOTE: only plain $VAR style variables are used (never the curly-brace form) so the
+            # script can live inside a CloudFormation Fn::Sub block without escaping.
+            set -euxo pipefail
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            BUCKET="${BackupBucket}"
+
+            # ---- 1. Install and start Apache (httpd) + cron ------------------------------
+            dnf update -y
+            dnf install -y httpd cronie
+            systemctl enable --now httpd
+            systemctl enable --now crond
+
+            # ---- 2. Read instance details from the metadata service (IMDSv2) --------------
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            meta() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+            INSTANCE_ID=$(meta instance-id)
+            AZ=$(meta placement/availability-zone)
+            PRIVATE_IP=$(meta local-ipv4)
+            INSTANCE_TYPE=$(meta instance-type)
+            # A colour derived from the instance id, so each server looks different in the browser
+            HUE=$(( $(echo -n "$INSTANCE_ID" | cksum | cut -d' ' -f1) % 360 ))
+
+            # ---- 3. Health-check page (used by the load balancer) and the web page --------
+            echo "OK" > /var/www/html/health.html
+
+            cat > /var/www/html/index.html <<EOF
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>EC2 High Availability Demo</title>
+              <style>
+                body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+                       font-family:system-ui,Segoe UI,Arial,sans-serif; color:#fff;
+                       background:linear-gradient(135deg, hsl($HUE,70%,32%), hsl($HUE,60%,18%)); }
+                .card { background:rgba(255,255,255,.12); padding:2.2rem 2.8rem; border-radius:16px; max-width:560px; }
+                h1 { margin:0 0 .3rem; font-size:1.7rem; }
+                .sub { opacity:.85; margin-bottom:1.4rem; }
+                .id { font-size:2rem; font-weight:700; color:#ffb84d; word-break:break-all; }
+                table { margin-top:1rem; border-collapse:collapse; width:100%; }
+                td { padding:.35rem 0; border-bottom:1px solid rgba(255,255,255,.2); }
+                td:first-child { opacity:.75; width:45%; }
+                footer { margin-top:1.4rem; font-size:.85rem; opacity:.8; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>AWS EC2 High Availability Demo</h1>
+                <div class="sub">Apache web server bootstrapped with EC2 User Data</div>
+                <div>This page was served by instance</div>
+                <div class="id">$INSTANCE_ID</div>
+                <table>
+                  <tr><td>Availability Zone</td><td>$AZ</td></tr>
+                  <tr><td>Private IP</td><td>$PRIVATE_IP</td></tr>
+                  <tr><td>Instance type</td><td>$INSTANCE_TYPE</td></tr>
+                  <tr><td>Web server</td><td>Apache httpd on Amazon Linux 2023</td></tr>
+                </table>
+                <footer>Refresh the page: the load balancer may send you to another server.<br>
+                Built by Rupesh Kumar Yadav - AWS Cloud Computing Internship Project</footer>
+              </div>
+            </body>
+            </html>
+            EOF
+
+            # ---- 4. Hourly backup of Apache access logs to S3 (uses the instance IAM role) -
+            echo "BUCKET=$BUCKET" > /etc/web-backup.conf
+
+            cat > /usr/local/bin/backup-logs.sh <<'SCRIPT'
+            #!/bin/bash
+            # Copies the Apache access log to S3. Triggered hourly by /etc/cron.d/backup-logs
+            set -euo pipefail
+            source /etc/web-backup.conf
+            if [ -z "$BUCKET" ] || [ "$BUCKET" = "${BackupBucket}" ]; then
+              echo "No bucket configured - skipping backup"; exit 0
+            fi
+            [ -f /var/log/httpd/access_log ] || exit 0
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            aws s3 cp /var/log/httpd/access_log "s3://$BUCKET/logs/$ID/access-$(date +%Y%m%d-%H%M).log"
+            SCRIPT
+            chmod +x /usr/local/bin/backup-logs.sh
+
+            echo "0 * * * * root /usr/local/bin/backup-logs.sh >> /var/log/backup-logs.log 2>&1" > /etc/cron.d/backup-logs
+            chmod 644 /etc/cron.d/backup-logs
+
+            echo "Bootstrap finished for $INSTANCE_ID"
+
+  # ---------------- Two web servers in different AZs (Days 2-4) ----------------
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      SubnetId: !Select [0, !Ref SubnetIds]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web-1" }]
+
+  WebServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      SubnetId: !Select [1, !Ref SubnetIds]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web-2" }]
+
+  # ---------------- Admin server + Elastic IP (Day 5) ----------------
+  AdminServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds: [!Ref AdminSecurityGroup]
+      MetadataOptions: { HttpTokens: required }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-admin" }]
+
+  AdminElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-admin-eip" }]
+
+  AdminElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt AdminElasticIp.AllocationId
+      InstanceId: !Ref AdminServer
+
+  # ---------------- Load balancer + health checks (Day 6) ----------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health.html
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Targets:
+        - { Id: !Ref WebServer1, Port: 80 }
+        - { Id: !Ref WebServer2, Port: 80 }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ---------------- Monitoring ----------------
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-unhealthy-hosts"
+      AlarmDescription: At least one web server failed its health check
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebsiteUrl:
+    Description: Open this in your browser (load balancer DNS name)
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  AdminElasticIp:
+    Description: Static public IP of the admin server (SSH here)
+    Value: !Ref AdminElasticIp
+  WebServer1Id:
+    Value: !Ref WebServer1
+  WebServer2Id:
+    Value: !Ref WebServer2
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  WebSecurityGroupId:
+    Value: !Ref WebSecurityGroup
+  InstanceProfileName:
+    Value: !Ref WebInstanceProfile
